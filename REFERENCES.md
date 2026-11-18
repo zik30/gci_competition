@@ -1,0 +1,14 @@
+# References
+
+Every external source of code or ideas used in this project. Code adapted from a
+source also carries a `# Source:` comment directly above it (rule R4).
+
+| # | Title | Author | URL | What was used | Where in notebook |
+| - | ----- | ------ | --- | ------------- | ----------------- |
+| 1 | GCI Global 2026 In-class Competition Tutorial (`tutorial.ipynb`, local copy in `docs/tutorial.ipynb`) | GCI organizers | Distributed with the competition materials (Omnicampus, `competition.zip`) | Notebook structure and section titles; the 5 baseline features and their preprocessing (label encoding, count encoding, mean imputation, `OWN_CAR_AGE` outlier handling + decade one-hot, `StandardScaler`); the RandomForest baseline model (`max_depth=10`); Section 6.2 code (verbatim) and Section 6.3 code (only the two filename strings changed) | §1–§2.2, §3.1, §4, §5.1, §5.3 (E0), §6.2, §6.3 |
+| 2 | GCI Global 2026 In-class Competition README (`README.ipynb`) | GCI organizers | Distributed with the competition materials | Competition rules (no external data, no hand-labeling, reproducibility), metric and submission format | §0, §3.0 |
+| 3 | scikit-learn documentation: `StratifiedKFold`, `roc_auc_score`, `RandomForestClassifier` | scikit-learn developers | https://scikit-learn.org/stable/ | API usage for the CV harness | §5.2 |
+| 4 | LightGBM documentation: Python API, `early_stopping` callback, parameters (`deterministic`, `force_row_wise`) | Microsoft / LightGBM developers | https://lightgbm.readthedocs.io/ | API usage for `run_cv_lgb` | §5.2 |
+| 5 | Home Credit Default Risk (original Kaggle competition, 2018) and its public discussion | Kaggle / Home Credit; community participants | https://www.kaggle.com/c/home-credit-default-risk (link given in the GCI `README.ipynb`) | General, widely shared feature *ideas* only (no code copied, no data used): credit/annuity, annuity/income, credit/income and credit/goods ratios; treating `DAYS_EMPLOYED = 365243` as a placeholder; aggregates of `EXT_SOURCE_*`. Implemented independently in `make_features` | §4.2 (`make_features`), E3–E9, E12 |
+| 6 | LightGBM documentation: `LGBMClassifier.fit` (`eval_X` / `eval_y`), `Booster.feature_importance(importance_type="gain")` | Microsoft / LightGBM developers | https://lightgbm.readthedocs.io/ | API usage for `run_cv_lgb` (Sprint 2 API update) and gain importance | §5.2, §5.3, §7.1 |
+| 7 | Wilson score interval for a binomial proportion (standard statistics formula) | E. B. Wilson (1927) | — (textbook formula) | 95% confidence intervals for default rates in the EDA | §3.2 (A4, A5, A8) |

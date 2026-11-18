@@ -1,0 +1,11 @@
+# data (never committed)
+input/*.csv
+# generated artifacts
+outputs/
+output/
+*.zip
+# environment
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+docs/
