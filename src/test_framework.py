@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cv import SEED, compare, load_or_make_folds, make_folds, run_cv_lgb, run_cv_sklearn  # noqa: E402
+from cv import SEED, compare, load_or_make_folds, make_folds, run_cv_lgb, run_cv_sklearn, run_cv_xgb  # noqa: E402
 
 train = pd.read_csv("input/train.csv", usecols=["TARGET", "EXT_SOURCE_2", "AMT_INCOME_TOTAL", "AMT_CREDIT"])
 y = train["TARGET"]
@@ -50,6 +50,13 @@ oof2, tp2, aucs2, _ = run_cv_sklearn(
     Xs.fillna(-1), ys, Xt.fillna(-1), fs)
 assert oof2.shape == (len(Xs),) and tp2.shape == (len(Xt),) and len(aucs2) == 5
 print(f"sklearn shapes: oof={oof2.shape}, test={tp2.shape}, folds={len(aucs2)} -> PASS")
+
+Xc = train.drop(columns="TARGET").iloc[idx].reset_index(drop=True)
+oof3, tp3, aucs3, it3 = run_cv_xgb(Xc, ys, Xc.iloc[:500], {"learning_rate": 0.1, "max_depth": 4}, fs)
+oof3b, tp3b, _, _ = run_cv_xgb(Xc, ys, Xc.iloc[:500], {"learning_rate": 0.1, "max_depth": 4}, fs)
+assert oof3.shape == (len(Xs),) and tp3.shape == (500,) and len(aucs3) == 5 and len(it3) == 5
+assert np.array_equal(oof3, oof3b) and np.array_equal(tp3, tp3b), "XGBoost CV is not deterministic"
+print(f"xgb shapes: oof={oof3.shape}, test={tp3.shape}, folds={len(aucs3)}, best_iters={it3}, deterministic=True -> PASS")
 
 print("\n== Test 4: compare() decision rule")
 base = [0.70, 0.70, 0.70, 0.70, 0.70]

@@ -85,6 +85,42 @@ def run_cv_lgb(X, y, X_test, params, folds, seed=SEED, cat_features="auto", impo
     return oof, test_pred, fold_aucs, best_iters
 
 
+# Source: XGBoost docs — XGBClassifier sklearn API, early_stopping_rounds, enable_categorical (see REFERENCES.md #9)
+def run_cv_xgb(X, y, X_test, params, folds, seed=SEED, importance_out=None):
+    """XGBoost CV with fold handling and outputs identical to run_cv_lgb (Sprint 3, Task X1).
+
+    Returns oof, test_pred, fold_aucs, best_iters. Native categorical support (category dtype columns).
+    """
+    import xgboost as xgb
+
+    oof = np.zeros(len(X))
+    test_pred = np.zeros(len(X_test))
+    fold_aucs, best_iters = [], []
+    n_splits = folds.max() + 1
+    for k in range(n_splits):
+        tr, va = np.where(folds != k)[0], np.where(folds == k)[0]
+        model = xgb.XGBClassifier(
+            **params,
+            n_estimators=10000,
+            early_stopping_rounds=200,
+            eval_metric="auc",
+            tree_method="hist",
+            enable_categorical=True,
+            max_cat_to_onehot=1,
+            random_state=seed,
+            n_jobs=N_JOBS,
+        )
+        model.fit(X.iloc[tr], y.iloc[tr], eval_set=[(X.iloc[va], y.iloc[va])], verbose=False)
+        oof[va] = model.predict_proba(X.iloc[va])[:, 1]
+        test_pred += model.predict_proba(X_test)[:, 1] / n_splits
+        fold_aucs.append(roc_auc_score(y.iloc[va], oof[va]))
+        best_iters.append(int(model.best_iteration))
+        if importance_out is not None:
+            importance_out.append(pd.Series(model.get_booster().get_score(importance_type="gain")))
+    print(f"Fold AUCs: {np.round(fold_aucs, 5)}")
+    print(f"Mean: {np.mean(fold_aucs):.5f} ± {np.std(fold_aucs):.5f} | OOF: {roc_auc_score(y, oof):.5f}")
+    return oof, test_pred, fold_aucs, best_iters
+
 def run_cv_sklearn(model, X, y, X_test, folds):
     """Same fold handling and outputs as run_cv_lgb, for any sklearn classifier (no early stopping).
 

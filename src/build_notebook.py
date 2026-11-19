@@ -24,16 +24,15 @@ md("""
 
 | Item | Value |
 | ---- | ----- |
-| Final model | _placeholder — to be filled in the final sprint (after tuning)_ |
-| Current best experiment | **E10** — LightGBM (`BASE_PARAMS`), 32 raw features + 5 credit ratios − `FLAG_MOBIL` (36 features) |
-| 5-fold CV AUC of E10 (mean ± std / OOF) | **0.75790 ± 0.00313 / 0.75784** (tutorial baseline E0: 0.67020 ± 0.00190) |
-| Public LB AUC | _placeholder_ |
+| Final model | **E21** — rank-average blend: 0.7 × tuned LightGBM (5-seed average, E19) + 0.3 × tuned XGBoost (E20); 36 features (32 raw + 5 credit ratios − `FLAG_MOBIL`) |
+| 5-fold CV AUC of E21 (mean ± std / OOF) | **0.76342 ± 0.00315 / 0.76339** (Sprint-2 best E10: 0.75790; tutorial baseline E0: 0.67020) |
+| Public LB AUC | E10: 0.7638 (E21: not submitted yet) |
 
 **Reproducibility:** one global `SEED = 42`, fixed `n_jobs`, frozen 5-fold split saved in `outputs/folds.npy`.
 *Restart & Run All* regenerates the submission CSV bit-for-bit (verified by MD5).
 This notebook is self-contained: it does not import from `src/`.
 
-**Structure:** Market analysis (§3.0) → EDA (§3) → Machine learning (§4–§6) → Model evaluation & analysis (§7) → Business proposal (§8) → References (§9) → Experiment log (Appendix A).
+**Structure:** Market analysis (§3.0) → EDA (§3) → Machine learning (§4–§6) → Model evaluation & analysis (§7) → Business proposal (§8) → References (§9) → Experiment log (Appendix A) → Optuna search (Appendix B).
 
 > Rule compliance: only `input/train.csv` and `input/test.csv` are used (no external data);
 > every test prediction comes from `predict_proba` of trained models (no hand-labeling);
@@ -53,7 +52,7 @@ from pathlib import Path
 import numpy as np, pandas as pd
 import matplotlib, matplotlib.pyplot as plt
 import seaborn as sns
-import sklearn, lightgbm as lgb
+import sklearn, lightgbm as lgb, xgboost as xgb, scipy
 warnings.filterwarnings("ignore")
 
 SEED = 42
@@ -65,7 +64,7 @@ def seed_everything(seed=SEED):
 seed_everything()
 
 print("Python", sys.version.split()[0], "|", platform.platform())
-for m in [np, pd, sklearn, lgb, matplotlib, sns]:
+for m in [np, pd, sklearn, lgb, xgb, scipy, matplotlib, sns]:
     print(f"{m.__name__:>12}: {m.__version__}")
 ''')
 md("""
@@ -229,7 +228,8 @@ md("""
 ### 4.2 Feature pipeline for the LightGBM experiments (`make_features`, Sprint 2)
 One function with on/off flags, used by every experiment E1–E13 (same code as `src/features.py`).
 It works on the full raw data (`train_full` / `test_full`), never uses `TARGET`, and returns sorted feature
-names. `FEATURE_FLAGS` below are the flags of the **current best experiment (E10)**; see Appendix A for the
+names. `FEATURE_FLAGS` below are the flags of E10 (the best Sprint-2 feature set). The final Sprint-3 models use
+the same feature set, because the Sprint-3 feature re-tests (E17, E18) were discarded. Appendix A lists the
 experiments that were tried and discarded.
 """)
 fe_src = (ROOT / "src/features.py").read_text()
@@ -237,14 +237,13 @@ fe_src = fe_src.split("import pandas as pd\n", 1)[1]
 code("# Source: own code (Sprint 2). Ratio / missing-value / EXT_SOURCE ideas are standard domain features, see §9.\n"
      + fe_src.strip())
 code('''
-# Flags of the current best experiment E10 (literal copy of outputs/params/E10.json)
+# Flags of E10 = feature set of the final models E19/E20/E21 (literal copy of outputs/params/E10.json)
 FEATURE_FLAGS = {
     **FEATURE_FLAGS_DEFAULT,
     "raw_all": True,                       # E2  KEEP
     "credit_ratios": True,                 # E4  KEEP
     "drop_low_importance": ["FLAG_MOBIL"], # E10 KEEP (zero gain / constant)
 }
-BEST_EXP = "E10"
 X_lgb, X_test_lgb, LGB_FEATURES, LGB_CATS = make_features(train_full, test_full, FEATURE_FLAGS)
 print(f"{len(LGB_FEATURES)} features, {len(LGB_CATS)} categorical: {LGB_CATS}")
 X_lgb.head(3)
@@ -286,8 +285,8 @@ md("#### Validation framework (frozen — `docs/validation-setup.md`; same code 
 cv_src = (ROOT / "src/cv.py").read_text()
 cv_src = cv_src.split("N_JOBS = 4")[1].split("\n", 1)[1]  # drop module header / imports / constants
 cv_src = cv_src.replace("    import lightgbm as lgb\n\n", "")
-code("# Source: docs/validation-setup.md §1-§3 (project validation spec) — adapted: load_or_make_folds and\n"
-     "# run_cv_sklearn added (same fold handling/outputs as run_cv_lgb)\n" + cv_src.strip())
+code("# Source: docs/validation-setup.md §1-§3 (project validation spec) — adapted: load_or_make_folds,\n"
+     "# run_cv_sklearn and run_cv_xgb (Sprint 3) added (same fold handling/outputs as run_cv_lgb)\n" + cv_src.strip())
 ut_src = (ROOT / "src/utils.py").read_text()
 ut_src = "LOG_COLS" + ut_src.split("LOG_COLS", 1)[1]
 ut_src = ut_src.split("def seed_everything")[0] + "def log_experiment" + ut_src.split("def log_experiment", 1)[1]
@@ -338,66 +337,205 @@ print(f"Tutorial-style holdout  Train: {roc_auc_score(y_train, rf_holdout.predic
       f"| Valid: {roc_auc_score(y_valid, rf_holdout.predict_proba(X_valid)[:, 1]):.5f}")
 ''')
 md("""
-#### Best model — E10: LightGBM on the Sprint-2 feature set
-LightGBM with the fixed Sprint-2 parameters (`BASE_PARAMS`, no tuning yet), early stopping on each validation
-fold (200 rounds), same frozen folds. The test prediction is the average of the 5 fold models'
-`predict_proba`. The run is checked against the stored E10 artifacts from the experiment runner.
+#### Hyperparameter search (Sprint 3, T1 / X1) — Optuna, switched off by default
+The tuned parameters below were found with Optuna (`TPESampler(seed=42)`, sequential trials, no pruning).
+The objective is the **mean 5-fold CV AUC on the frozen folds** (never a single split), with the learning rate
+fixed at 0.05. LightGBM: 60 trials (T1); XGBoost: 30 trials (X1). The search takes about 2 hours on 4 CPU
+threads, so it is behind `RUN_OPTUNA = False`. The results are copied into the notebook as literals in the
+next cells. Setting `RUN_OPTUNA = True` re-runs the search and rewrites `outputs/optuna/` (same code as
+`src/tune_lgb.py` and `src/tune_xgb.py`). History plots and parameter importance are in Appendix B.
+
+**Tuning-overfit check (E14).** Tuning on the main folds could overfit those folds. E14 (tuned vs Sprint-2
+params) was therefore re-run on 3 alternative fold sets (`StratifiedKFold` seeds 1, 2, 3). The gain on the main
+folds is +0.00450, and on the alternative folds it is +0.00393 / +0.00376 / +0.00475 (about 92% of the main
+gain), so the gain is real.
 """)
 code('''
-# Fixed LightGBM params for Sprint 2 (docs/sprints/sprint-2.md §2) — tuning happens in Sprint 3
-BASE_PARAMS = dict(
+# Source: Optuna API — TPESampler / create_study / get_param_importances (see §9); search spaces from the
+# project plan docs/sprints/sprint-3.md §3-§4. Same code as src/tune_lgb.py, src/tune_xgb.py.
+RUN_OPTUNA = False
+
+def lgb_search_space(trial):
+    return {
+        "num_leaves":        trial.suggest_int("num_leaves", 8, 128, log=True),
+        "max_depth":         trial.suggest_int("max_depth", 3, 12),
+        "min_child_samples": trial.suggest_int("min_child_samples", 20, 400, log=True),
+        "feature_fraction":  trial.suggest_float("feature_fraction", 0.3, 1.0),
+        "bagging_fraction":  trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        "reg_alpha":         trial.suggest_float("reg_alpha", 1e-3, 30, log=True),
+        "reg_lambda":        trial.suggest_float("reg_lambda", 1e-3, 30, log=True),
+        "min_split_gain":    trial.suggest_float("min_split_gain", 0.0, 1.0),
+        "cat_smooth":        trial.suggest_float("cat_smooth", 1, 100, log=True),
+        "cat_l2":            trial.suggest_float("cat_l2", 1, 100, log=True),
+        "min_data_per_group": trial.suggest_int("min_data_per_group", 20, 500, log=True),
+        "max_cat_threshold": trial.suggest_int("max_cat_threshold", 8, 64),
+    }
+
+def xgb_search_space(trial):
+    return {
+        "max_depth":         trial.suggest_int("max_depth", 3, 10),
+        "min_child_weight":  trial.suggest_float("min_child_weight", 1, 100, log=True),
+        "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.3, 1.0),
+        "reg_alpha":         trial.suggest_float("reg_alpha", 1e-3, 30, log=True),
+        "reg_lambda":        trial.suggest_float("reg_lambda", 1e-3, 30, log=True),
+        "gamma":             trial.suggest_float("gamma", 0.0, 5.0),
+        "max_cat_threshold": trial.suggest_int("max_cat_threshold", 8, 64),
+    }
+
+def run_optuna(kind, n_trials):
+    import optuna, contextlib, io
+    fixed = (dict(objective="binary", learning_rate=0.05, bagging_freq=1) if kind == "lgb"
+             else dict(learning_rate=0.05))
+    space = lgb_search_space if kind == "lgb" else xgb_search_space
+    def objective(trial):
+        params = {**fixed, **space(trial)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            if kind == "lgb":
+                _, _, fa, _ = run_cv_lgb(X_lgb, y, X_test_lgb.iloc[:1], params, folds, seed=SEED, cat_features=LGB_CATS)
+            else:
+                _, _, fa, _ = run_cv_xgb(X_lgb, y, X_test_lgb.iloc[:1], params, folds, seed=SEED)
+        trial.set_user_attr("fold_aucs", [round(v, 6) for v in fa])
+        return float(np.mean(fa))
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
+    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    (OUT / "optuna").mkdir(parents=True, exist_ok=True)
+    study.trials_dataframe().to_csv(OUT / "optuna" / f"{kind}_study.csv", index=False)
+    pd.Series(optuna.importance.get_param_importances(study), name="importance").to_csv(
+        OUT / "optuna" / f"{kind}_param_importance.csv")
+    json.dump({"best_value": study.best_value, "best_trial": study.best_trial.number,
+               "params": {**fixed, **study.best_params}, "fold_aucs": study.best_trial.user_attrs["fold_aucs"]},
+              open(OUT / "optuna" / f"{kind}_best_params.json", "w"), indent=2)
+    return study
+
+if RUN_OPTUNA:
+    lgb_study = run_optuna("lgb", 60)
+    xgb_study = run_optuna("xgb", 30)
+    print("LightGBM best:", lgb_study.best_value, lgb_study.best_params)
+    print("XGBoost  best:", xgb_study.best_value, xgb_study.best_params)
+else:
+    print("RUN_OPTUNA = False -> using the literal tuned parameters below")
+''')
+md("""
+#### Final model, part 1 — E19: tuned LightGBM, average of 5 seeds
+LightGBM with the tuned parameters (T1 / E14). The learning rate stays at 0.05: 0.02 (E15) and 0.01 (E16) did
+not improve CV. The model is trained 5 times with seeds 42–46 on the same frozen folds, and the OOF and test
+predictions are averaged (S1 / E19: +0.00069, 5/5 folds). Each run uses early stopping on its validation fold
+(200 rounds), and its test prediction is the average of its 5 fold models' `predict_proba`. Features: the Sprint-2
+set from §4.2 (re-adding EXT_SOURCE aggregates (E17) or missing/bureau features (E18) did not help).
+""")
+code('''
+# Tuned LightGBM params: literal copy of outputs/optuna/lgb_best_params.json (T1, trial 25, CV 0.76240)
+LGB_PARAMS = dict(
     objective="binary",
     learning_rate=0.05,
-    num_leaves=31,
-    min_child_samples=50,
-    feature_fraction=0.8,
-    bagging_fraction=0.8,
     bagging_freq=1,
-    reg_lambda=1.0,
+    num_leaves=9,
+    max_depth=4,
+    min_child_samples=63,
+    feature_fraction=0.33659756616656034,
+    bagging_fraction=0.8531556342271209,
+    reg_alpha=0.7533466964187072,
+    reg_lambda=7.219902584162699,
+    min_split_gain=0.6750913711780251,
+    cat_smooth=56.94958502272585,
+    cat_l2=76.69763415418393,
+    min_data_per_group=278,
+    max_cat_threshold=25,
 )
-best_imps = []
-best_oof, best_test_pred, best_fold_aucs, best_iters = run_cv_lgb(
-    X_lgb, y, X_test_lgb, BASE_PARAMS, folds, seed=SEED, cat_features=LGB_CATS, importance_out=best_imps)
-print("best iterations:", best_iters)
+LGB_SEEDS = [42, 43, 44, 45, 46]
+lgb_imps, _oofs, _tests, lgb_iters = [], [], [], []
+for s in LGB_SEEDS:
+    print(f"--- LightGBM seed {s}")
+    o, t, _, it = run_cv_lgb(X_lgb, y, X_test_lgb, LGB_PARAMS, folds, seed=s, cat_features=LGB_CATS,
+                             importance_out=lgb_imps)
+    _oofs.append(o); _tests.append(t); lgb_iters.append(it)
+lgb_oof, lgb_test = np.mean(_oofs, axis=0), np.mean(_tests, axis=0)   # fixed formula: plain average
+lgb_fold_aucs = [roc_auc_score(y[folds == k], lgb_oof[folds == k]) for k in range(5)]
+print(f"E19 (5-seed average) fold AUCs: {np.round(lgb_fold_aucs, 5)} | mean {np.mean(lgb_fold_aucs):.5f} "
+      f"| OOF {roc_auc_score(y, lgb_oof):.5f}")
 ''')
+md("""
+#### Final model, part 2 — E20: tuned XGBoost (blend component)
+XGBoost (`hist` trees, native categorical handling) on the same features and folds, with the tuned parameters
+from X1. It was tuned at learning rate 0.05, which is also the final LightGBM learning rate, so no refit was
+needed. Early stopping is on each validation fold (200 rounds), and `predict_proba` uses the best iteration.
+On its own it is slightly weaker than E19 (0.76206 vs 0.76308). It is used only as the second model in the blend.
+""")
 code('''
-log_experiment({
-    "exp_id": BEST_EXP, "date": "2026-11-19", "parent_id": "E4",
-    "hypothesis": "Fewer noisy features (zero gain / near-constant), same or better AUC",
-    "change": "drop_low_importance", "model": "lgb", "n_features": len(LGB_FEATURES),
-    **{f"fold_{k+1}": round(a, 5) for k, a in enumerate(best_fold_aucs)},
-    "mean_auc": round(float(np.mean(best_fold_aucs)), 5), "std_auc": round(float(np.std(best_fold_aucs)), 5),
-    "oof_auc": round(roc_auc_score(y, best_oof), 5), "verdict": "KEEP",
-}, log_path="experiments/experiment_log.csv")   # idempotent: skipped if E10 is already logged
-best_importance = pd.concat(best_imps, axis=1)
-best_importance = pd.DataFrame({"gain_mean": best_importance.mean(axis=1), "gain_std": best_importance.std(axis=1)}
-                               ).sort_values("gain_mean", ascending=False)
-stored = OUT / "test_preds" / f"{BEST_EXP}_test.npy"
-if stored.exists():   # consistency with the experiment runner (src/run_experiment.py)
-    assert np.array_equal(np.load(stored), best_test_pred), "notebook result differs from the logged E10 run"
-    assert np.array_equal(np.load(OUT / "oof" / f"{BEST_EXP}_oof.npy"), best_oof)
-    print(f"{BEST_EXP}: notebook predictions are bit-identical to the stored experiment artifacts")
-else:
-    save_artifacts(BEST_EXP, best_oof, best_test_pred, {"model": "lgb", "lgb_params": BASE_PARAMS,
-                   "flags": FEATURE_FLAGS}, LGB_FEATURES, best_iters, out_dir="outputs")
+# Tuned XGBoost params: literal copy of outputs/optuna/xgb_best_params.json (X1, CV 0.76206)
+XGB_PARAMS = dict(
+    learning_rate=0.05,
+    max_depth=3,
+    min_child_weight=30.14958744826777,
+    subsample=0.6620910504918238,
+    colsample_bytree=0.6874890830880247,
+    reg_alpha=11.520010553131216,
+    reg_lambda=0.004388272705102041,
+    gamma=1.2995702542443917,
+    max_cat_threshold=23,
+)
+xgb_oof, xgb_test, xgb_fold_aucs, xgb_iters = run_cv_xgb(X_lgb, y, X_test_lgb, XGB_PARAMS, folds, seed=SEED)
 ''')
 md("""
 ### 5.4 (Optional) Ensemble Learning
-*Placeholder — planned for Sprint 3 (seed averaging, XGBoost, OOF-based rank-average blend).*
+**B1 / E21: rank-average blend of LightGBM (E19) and XGBoost (E20), using a fixed formula (rule R2).**
+Each model's predictions are converted to ranks scaled to (0, 1] (`rankdata(p) / len(p)`), separately for OOF
+and test, and then combined as `blend = w · rank_lgb + (1 − w) · rank_xgb`. The LightGBM weight `w` was chosen
+on a coarse grid 0.0, 0.1, …, 1.0 by OOF AUC (the grid is coarse to limit overfitting to the OOF predictions),
+which gave **w = 0.7**. It is used here as a literal. The two models are highly correlated (Spearman 0.985 on
+OOF), so the gain is small: +0.00033 on 5/5 folds. The gain held on the 3 alternative fold sets, so the blend
+was kept after the CONFIRM step (4/4 fold sets won).
+
+*Note:* the blend is a **rank score**. It is fine for AUC, which only uses the order of the predictions, but it
+is not a calibrated probability of default. For the business tables in §8 (expected default rates at
+cut-offs) we use the LightGBM probabilities `lgb_oof` / `lgb_test`.
 """)
+code('''
+# Source: scipy.stats.rankdata (see §9); blend formula and weight from B1 (src/blend.py)
+from scipy.stats import rankdata, spearmanr
+W_LGB = 0.7
+
+def rank01(p):
+    return rankdata(p) / len(p)
+
+blend_oof = W_LGB * rank01(lgb_oof) + (1 - W_LGB) * rank01(xgb_oof)
+blend_test = W_LGB * rank01(lgb_test) + (1 - W_LGB) * rank01(xgb_test)
+blend_fold_aucs = [roc_auc_score(y[folds == k], blend_oof[folds == k]) for k in range(5)]
+print(f"Spearman(LightGBM, XGBoost) on OOF: {spearmanr(lgb_oof, xgb_oof).correlation:.4f}")
+print(pd.DataFrame({"E19 LightGBM": lgb_fold_aucs, "E20 XGBoost": xgb_fold_aucs, "E21 blend": blend_fold_aucs},
+                   index=[f"fold {k+1}" for k in range(5)]).T.assign(mean=lambda d: d.mean(axis=1)).round(5))
+''')
+code('''
+BEST_EXP = "E21"
+final_runs = {"E19": (lgb_oof, lgb_test), "E20": (xgb_oof, xgb_test), "E21": (blend_oof, blend_test)}
+for exp, (o, t) in final_runs.items():   # consistency with the experiment runner (src/run_experiment3.py, src/blend.py)
+    stored = OUT / "test_preds" / f"{exp}_test.npy"
+    if stored.exists():
+        assert np.array_equal(np.load(stored), t), f"notebook test prediction differs from the logged {exp} run"
+        assert np.array_equal(np.load(OUT / "oof" / f"{exp}_oof.npy"), o), f"notebook OOF differs from {exp}"
+        print(f"{exp}: notebook predictions are bit-identical to the stored experiment artifacts")
+    else:
+        print(f"{exp}: no stored artifacts (fresh environment) — see Appendix A for the logged results")
+best_importance = pd.concat(lgb_imps, axis=1)   # 5 seeds x 5 folds of the final LightGBM
+best_importance = pd.DataFrame({"gain_mean": best_importance.mean(axis=1), "gain_std": best_importance.std(axis=1)}
+                               ).sort_values("gain_mean", ascending=False)
+''')
 
 # ---------------------------------------------------------------- 6
 md(T(95))
 md("""
 ### 6.1 Predicting on the test data
-The prediction is the average of the 5 fold models' `predict_proba` on the test data from the current best
-experiment (**E10**, LightGBM). No prediction is modified after `predict_proba`. The E0 baseline prediction
+The prediction comes from the final model **E21**: the fixed-formula rank-average blend (§5.4,
+`w = 0.7`) of the tuned 5-seed LightGBM (E19) and the tuned XGBoost (E20). Each component is the average of
+its fold models' `predict_proba`. No prediction is changed by hand (rule R2). The E0 baseline prediction
 (`e0_test_pred`) is kept only for comparison.
 """)
 code('''
 # Make predictions for the test data
-# Average of the 5 fold models of the current best experiment (E10)
-pred = best_test_pred
+# Final model E21: 0.7 * rank(LightGBM E19) + 0.3 * rank(XGBoost E20)
+pred = blend_test
 ''')
 md(T(98))
 code(T(99))
@@ -427,14 +565,14 @@ md("""
 ## 7. Model Evaluation & Analysis
 *Full evaluation (SHAP via LightGBM `pred_contrib=True`, error analysis, approval-rate curves) in Sprint 4.*
 
-#### 7.1 Preview: top 20 features of E10 by mean gain over the 5 folds
+#### 7.1 Preview: top 20 features of the final LightGBM (E19) by mean gain over 5 seeds x 5 folds
 """)
 code('''
 fig, ax = plt.subplots(figsize=(7, 6))
 top20 = best_importance.head(20)[::-1]
 ax.barh(top20.index, top20["gain_mean"], xerr=top20["gain_std"], color="#4C72B0")
-ax.set_xlabel("mean gain (± std over folds)"); ax.set_title(f"{BEST_EXP}: top 20 features by gain")
-fig.savefig("reports/figures/E10_top20_gain.png", dpi=120, bbox_inches="tight"); plt.show()
+ax.set_xlabel("mean gain (± std over 25 models)"); ax.set_title("E19 LightGBM: top 20 features by gain")
+fig.savefig("reports/figures/E19_top20_gain.png", dpi=120, bbox_inches="tight"); plt.show()
 best_importance.head(20).round(1)
 ''')
 md("""
@@ -448,6 +586,33 @@ md("## 9. References\n" + refs)
 md("## Appendix A. Experiment log\nRendered from `experiments/experiment_log.csv`.")
 code('''
 pd.read_csv("experiments/experiment_log.csv")
+''')
+md("""
+## Appendix B. Optuna search (T1 LightGBM, X1 XGBoost)
+Trial history and parameter importance (fANOVA, `optuna.importance.get_param_importances`). The plots are drawn
+from the saved studies in `outputs/optuna/`, which `RUN_OPTUNA = True` in §5.3 regenerates. The dashed line is
+the untuned reference: E10 (Sprint-2 `BASE_PARAMS`, CV 0.75790).
+""")
+code('''
+study_files = {"T1 LightGBM (60 trials)": OUT / "optuna" / "lgb_study.csv",
+               "X1 XGBoost (30 trials)": OUT / "optuna" / "xgb_study.csv"}
+if all(f.exists() for f in study_files.values()):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.8), sharey=True)
+    for ax, (name, f) in zip(axes, study_files.items()):
+        v = pd.read_csv(f)["value"].values
+        ax.scatter(range(len(v)), v, s=16, color="#86b6ef", label="trial")
+        ax.plot(range(len(v)), np.maximum.accumulate(v), color="#2a78d6", lw=2, label="best so far")
+        ax.axhline(0.75790, color="#898781", lw=1, ls="--")
+        ax.set_title(name, loc="left"); ax.set_xlabel("trial")
+        ax.grid(axis="y", color="#e1e0d9", lw=0.8); ax.set_axisbelow(True)
+        for sp in ["top", "right"]: ax.spines[sp].set_visible(False)
+    axes[0].set_ylabel("mean 5-fold CV AUC"); axes[0].legend(frameon=False, loc="lower right")
+    axes[0].set_ylim(np.percentile(pd.read_csv(study_files["X1 XGBoost (30 trials)"])["value"], 5) - 0.001, 0.7635)
+    fig.tight_layout(); fig.savefig("reports/figures/optuna_history_sprint3.png", dpi=120); plt.show()
+    display(pd.concat({k: pd.read_csv(OUT / "optuna" / f"{k}_param_importance.csv", index_col=0)["importance"]
+                       for k in ["lgb", "xgb"]}, axis=1).round(3).sort_values("lgb", ascending=False))
+else:
+    print("No saved Optuna studies in outputs/optuna/ — set RUN_OPTUNA = True in §5.3 to create them")
 ''')
 
 nb = nbf.v4.new_notebook()
